@@ -1,6 +1,8 @@
 """Live market data + simple technical scoring for AlphaOptionsAI."""
 
+import re
 from dataclasses import dataclass
+from typing import Optional
 
 import yfinance as yf
 
@@ -24,24 +26,73 @@ class ScanResult:
     confidence: float
 
 
+def clean_ticker(raw: str) -> str:
+    """Strip spaces/punctuation and uppercase, e.g. ' NVDA ' -> 'NVDA'."""
+    return re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+
+
+def _get_price_fields(tk: yf.Ticker) -> tuple[Optional[float], Optional[float]]:
+    """Try fast_info, then info, then 1-day history for (current_price, previous_close)."""
+
+    # 1. fast_info -- cheapest and usually most accurate for live price.
+    try:
+        fast_info = tk.fast_info
+        current_price = fast_info.get("lastPrice") or fast_info.get("last_price")
+        previous_close = fast_info.get("previousClose") or fast_info.get("previous_close")
+        if current_price and previous_close:
+            return float(current_price), float(previous_close)
+    except Exception:
+        pass
+
+    # 2. info -- slower, but a reliable fallback.
+    try:
+        info = tk.info
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        previous_close = info.get("previousClose") or info.get("regularMarketPreviousClose")
+        if current_price and previous_close:
+            return float(current_price), float(previous_close)
+    except Exception:
+        pass
+
+    # 3. history(period="1d") -- last resort.
+    try:
+        day_hist = tk.history(period="1d", interval="1d")
+        if day_hist is not None and not day_hist.empty:
+            current_price = float(day_hist["Close"].iloc[-1])
+            return current_price, None
+    except Exception:
+        pass
+
+    return None, None
+
+
 def _fetch_scan_result(ticker: str) -> ScanResult:
-    symbol = ticker.upper()
+    symbol = clean_ticker(ticker)
+    print(f"[AlphaOptionsAI] Searching ticker: {symbol}")
+
+    if not symbol:
+        raise TickerNotFoundError(f"❌ Could not find ticker {ticker!r}")
+
     tk = yf.Ticker(symbol)
 
-    # 6mo of daily history gives enough bars for a stable 20 EMA.
-    hist = tk.history(period="6mo", interval="1d")
+    current_price, live_previous_close = _get_price_fields(tk)
+    if current_price is None:
+        raise TickerNotFoundError(f"❌ Could not find ticker {symbol}")
+
+    # 6mo of daily history (raw, unadjusted) gives enough bars for a stable 20 EMA
+    # without split/dividend back-adjustment distorting recent prices.
+    hist = tk.history(period="6mo", interval="1d", auto_adjust=False)
     if hist is None or hist.empty:
-        raise TickerNotFoundError(f"No market data found for '{symbol}'.")
+        raise TickerNotFoundError(f"❌ Could not find ticker {symbol}")
 
     closes = hist["Close"].dropna()
     if len(closes) < 2:
-        raise TickerNotFoundError(f"Not enough price history for '{symbol}'.")
+        raise TickerNotFoundError(f"❌ Could not find ticker {symbol}")
 
-    current_price = float(closes.iloc[-1])
-    previous_close = float(closes.iloc[-2])
+    previous_close = live_previous_close if live_previous_close is not None else float(closes.iloc[-2])
     daily_change_pct = ((current_price - previous_close) / previous_close) * 100
 
-    year_hist = tk.history(period="1y", interval="1d")
+    year_hist = tk.history(period="1y", interval="1d", auto_adjust=False)
     if year_hist is None or year_hist.empty:
         year_hist = hist
     high_52w = float(year_hist["High"].max())
@@ -50,7 +101,11 @@ def _fetch_scan_result(ticker: str) -> ScanResult:
     volume = int(hist["Volume"].iloc[-1])
     avg_volume = float(hist["Volume"].mean())
 
-    ema20_series = closes.ewm(span=20, adjust=False).mean()
+    # Use the live current price as the most recent EMA input so the trend
+    # reflects the real-time quote rather than the last daily close.
+    ema_input_closes = closes.copy()
+    ema_input_closes.iloc[-1] = current_price
+    ema20_series = ema_input_closes.ewm(span=20, adjust=False).mean()
     ema20 = float(ema20_series.iloc[-1])
 
     if current_price > ema20:

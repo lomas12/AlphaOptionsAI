@@ -132,7 +132,7 @@ async def scan(interaction: discord.Interaction, ticker: str) -> None:
     try:
         result = await get_scan_result(ticker)
     except TickerNotFoundError as exc:
-        await interaction.followup.send(f"⚠️ {exc}")
+        await interaction.followup.send(str(exc))
         return
     except Exception:
         await interaction.followup.send(
