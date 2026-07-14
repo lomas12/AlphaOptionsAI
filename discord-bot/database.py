@@ -1,0 +1,294 @@
+"""SQLite persistence for AlphaOptionsAI V2: recommendations, outcomes, and
+self-learning strategy weights."""
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator, Optional
+
+DB_PATH = Path(__file__).parent / "alphaoptionsai.db"
+
+# Learned weight bounds -- keeps the feedback loop from running away in
+# either direction after a hot or cold streak.
+MIN_WEIGHT = 0.5
+MAX_WEIGHT = 2.0
+WIN_MULTIPLIER = 1.05
+LOSS_MULTIPLIER = 0.95
+
+DEFAULT_TAGS = [
+    "trend_stack_bullish",
+    "trend_stack_bearish",
+    "above_ema50",
+    "below_ema50",
+    "rsi_bullish",
+    "rsi_bearish",
+    "rsi_overbought",
+    "rsi_oversold",
+    "macd_bullish",
+    "macd_bearish",
+    "volume_confirmation",
+    "room_to_resistance",
+    "room_to_support",
+    "resistance_overhead",
+    "support_below",
+    "market_trend_aligned",
+    "market_trend_against",
+    "vix_supportive",
+    "vix_elevated",
+    "positive_news_sentiment",
+    "negative_news_sentiment",
+    "analyst_upgrade",
+    "analyst_downgrade",
+    "earnings_event_risk",
+]
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recommendations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                option_type TEXT NOT NULL,
+                strike REAL NOT NULL,
+                expiration TEXT NOT NULL,
+                entry_premium REAL NOT NULL,
+                take_profit_1 REAL NOT NULL,
+                take_profit_2 REAL NOT NULL,
+                stop_loss REAL NOT NULL,
+                confidence REAL NOT NULL,
+                risk_rating TEXT NOT NULL,
+                strategy_tags TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                closed_at TEXT,
+                exit_premium REAL,
+                return_pct REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_weights (
+                tag TEXT PRIMARY KEY,
+                weight REAL NOT NULL DEFAULT 1.0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        for tag in DEFAULT_TAGS:
+            conn.execute(
+                "INSERT OR IGNORE INTO strategy_weights (tag, weight) VALUES (?, 1.0)",
+                (tag,),
+            )
+
+
+def get_weights() -> dict[str, float]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT tag, weight FROM strategy_weights").fetchall()
+        return {row["tag"]: row["weight"] for row in rows}
+
+
+def record_recommendation(
+    *,
+    ticker: str,
+    option_type: str,
+    strike: float,
+    expiration: str,
+    entry_premium: float,
+    take_profit_1: float,
+    take_profit_2: float,
+    stop_loss: float,
+    confidence: float,
+    risk_rating: str,
+    strategy_tags: list[str],
+    source: str = "manual",
+) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO recommendations (
+                created_at, ticker, option_type, strike, expiration, entry_premium,
+                take_profit_1, take_profit_2, stop_loss, confidence, risk_rating,
+                strategy_tags, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _utcnow(),
+                ticker,
+                option_type,
+                strike,
+                expiration,
+                entry_premium,
+                take_profit_1,
+                take_profit_2,
+                stop_loss,
+                confidence,
+                risk_rating,
+                json.dumps(strategy_tags),
+                source,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def get_open_recommendations() -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM recommendations WHERE status = 'OPEN'"
+        ).fetchall()
+
+
+def close_recommendation(
+    rec_id: int, *, status: str, exit_premium: float, return_pct: float
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE recommendations
+            SET status = ?, exit_premium = ?, return_pct = ?, closed_at = ?
+            WHERE id = ?
+            """,
+            (status, exit_premium, return_pct, _utcnow(), rec_id),
+        )
+
+
+def apply_learning(strategy_tags: list[str], *, won: bool) -> None:
+    multiplier = WIN_MULTIPLIER if won else LOSS_MULTIPLIER
+    with _connect() as conn:
+        for tag in strategy_tags:
+            row = conn.execute(
+                "SELECT weight, wins, losses FROM strategy_weights WHERE tag = ?", (tag,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO strategy_weights (tag, weight, wins, losses) VALUES (?, 1.0, 0, 0)",
+                    (tag,),
+                )
+                weight, wins, losses = 1.0, 0, 0
+            else:
+                weight, wins, losses = row["weight"], row["wins"], row["losses"]
+
+            new_weight = max(MIN_WEIGHT, min(MAX_WEIGHT, weight * multiplier))
+            wins += 1 if won else 0
+            losses += 0 if won else 1
+            conn.execute(
+                "UPDATE strategy_weights SET weight = ?, wins = ?, losses = ? WHERE tag = ?",
+                (new_weight, wins, losses, tag),
+            )
+
+
+@dataclass
+class Stats:
+    total_trades: int
+    wins: int
+    losses: int
+    open_trades: int
+    win_rate: float
+    avg_return_pct: float
+    profit_factor: Optional[float]
+
+
+def get_overall_stats() -> Stats:
+    with _connect() as conn:
+        closed = conn.execute(
+            "SELECT status, return_pct FROM recommendations WHERE status != 'OPEN'"
+        ).fetchall()
+        open_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM recommendations WHERE status = 'OPEN'"
+        ).fetchone()["c"]
+
+    total = len(closed)
+    wins = sum(1 for r in closed if r["status"].startswith("WIN"))
+    losses = total - wins
+    win_rate = round((wins / total) * 100, 1) if total else 0.0
+    avg_return = round(sum(r["return_pct"] or 0 for r in closed) / total, 2) if total else 0.0
+
+    gains = sum(r["return_pct"] for r in closed if (r["return_pct"] or 0) > 0)
+    drawdowns = -sum(r["return_pct"] for r in closed if (r["return_pct"] or 0) < 0)
+    profit_factor = round(gains / drawdowns, 2) if drawdowns > 0 else None
+
+    return Stats(
+        total_trades=total,
+        wins=wins,
+        losses=losses,
+        open_trades=open_count,
+        win_rate=win_rate,
+        avg_return_pct=avg_return,
+        profit_factor=profit_factor,
+    )
+
+
+def get_accuracy_by_ticker() -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT ticker,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN status LIKE 'WIN%' THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(return_pct), 2) AS avg_return
+            FROM recommendations
+            WHERE status != 'OPEN'
+            GROUP BY ticker
+            ORDER BY wins DESC, total DESC
+            """
+        ).fetchall()
+
+
+def get_accuracy_by_strategy() -> list[dict]:
+    """Aggregate win rate per individual strategy tag across closed trades."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT strategy_tags, status, return_pct FROM recommendations WHERE status != 'OPEN'"
+        ).fetchall()
+
+    tag_stats: dict[str, dict] = {}
+    for row in rows:
+        tags = json.loads(row["strategy_tags"])
+        won = row["status"].startswith("WIN")
+        for tag in tags:
+            bucket = tag_stats.setdefault(tag, {"wins": 0, "total": 0, "return_sum": 0.0})
+            bucket["total"] += 1
+            bucket["wins"] += 1 if won else 0
+            bucket["return_sum"] += row["return_pct"] or 0
+
+    leaderboard = []
+    for tag, bucket in tag_stats.items():
+        win_rate = round((bucket["wins"] / bucket["total"]) * 100, 1) if bucket["total"] else 0.0
+        avg_return = round(bucket["return_sum"] / bucket["total"], 2) if bucket["total"] else 0.0
+        leaderboard.append(
+            {"tag": tag, "total": bucket["total"], "win_rate": win_rate, "avg_return": avg_return}
+        )
+    leaderboard.sort(key=lambda x: (x["win_rate"], x["total"]), reverse=True)
+    return leaderboard
+
+
+def get_history(limit: int = 10) -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM recommendations ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+
+init_db()
