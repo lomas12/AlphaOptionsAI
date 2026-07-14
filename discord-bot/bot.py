@@ -5,6 +5,7 @@ import discord
 from discord import app_commands
 
 from market_data import ScanResult, TickerNotFoundError, get_scan_result
+from options_scanner import ContractPick, NoOptionsAvailableError, OptionsScanResult, scan_options
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 
@@ -85,6 +86,44 @@ def _build_scan_embed(result: ScanResult) -> discord.Embed:
     return embed
 
 
+def _build_contract_field_value(pick: ContractPick) -> str:
+    return (
+        f"Strike: **${pick.strike:.2f}**\n"
+        f"Expiration: {pick.expiration}\n"
+        f"Premium: ${pick.premium:.2f}\n"
+        f"OI: {pick.open_interest:,}\n"
+        f"Volume: {pick.volume:,}\n"
+        f"IV: {pick.implied_vol * 100:.1f}%\n"
+        f"AI Score: {pick.score:.0f}/100"
+    )
+
+
+def _build_options_embed(ticker: str, result: OptionsScanResult) -> discord.Embed:
+    if result.risk == "Low":
+        color = discord.Color.green()
+    elif result.risk == "Medium":
+        color = discord.Color.gold()
+    else:
+        color = discord.Color.red()
+
+    embed = discord.Embed(title=f"🧠 AlphaOptionsAI Options Scan — {ticker}", color=color)
+    embed.add_field(name="📈 Best Call", value=_build_contract_field_value(result.best_call), inline=True)
+    embed.add_field(name="📉 Best Put", value=_build_contract_field_value(result.best_put), inline=True)
+    embed.add_field(
+        name="Expected Move",
+        value=f"±${result.expected_move:.2f} ({result.expected_move_pct:.2f}%)",
+        inline=True,
+    )
+    embed.add_field(name="Risk", value=result.risk, inline=True)
+    embed.add_field(name="Win Probability", value=f"{result.win_probability:.1f}%", inline=True)
+    embed.add_field(name="Suggested Entry", value=f"${result.entry:.2f}", inline=True)
+    embed.add_field(name="Suggested Exit", value=f"${result.exit_target:.2f}", inline=True)
+    embed.add_field(name="Suggested Stop Loss", value=f"${result.stop_loss:.2f}", inline=True)
+    embed.set_footer(text="AlphaOptionsAI Beta • Not financial advice")
+
+    return embed
+
+
 @client.tree.command(name="scan", description="Run an AlphaOptionsAI scan on a ticker")
 @app_commands.describe(ticker="Stock ticker symbol to scan, e.g. ORCL")
 async def scan(interaction: discord.Interaction, ticker: str) -> None:
@@ -101,8 +140,21 @@ async def scan(interaction: discord.Interaction, ticker: str) -> None:
         )
         return
 
-    embed = _build_scan_embed(result)
-    await interaction.followup.send(embed=embed)
+    embeds = [_build_scan_embed(result)]
+
+    try:
+        options_result = await scan_options(result.ticker, result.current_price)
+        embeds.append(_build_options_embed(result.ticker, options_result))
+    except NoOptionsAvailableError as exc:
+        embeds[0].add_field(name="Options Scan", value=f"⚠️ {exc}", inline=False)
+    except Exception:
+        embeds[0].add_field(
+            name="Options Scan",
+            value="⚠️ Couldn't fetch the options chain right now. Please try again shortly.",
+            inline=False,
+        )
+
+    await interaction.followup.send(embeds=embeds)
 
 
 @client.event
