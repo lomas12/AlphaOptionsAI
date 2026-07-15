@@ -32,20 +32,23 @@ def clean_ticker(raw: str) -> str:
 
 
 def get_quote(symbol: str) -> Quote | None:
-    """Fetch the current quote. A price is never trusted from a single
-    unverified snapshot: we always also pull the latest 1-minute intraday
-    bar (a second, independently-timestamped reading) so the caller can
-    cross-check the two and know exactly when the price was observed.
+    """Fetch the current quote.
+
+    Extended-hours (pre-market / after-hours) trades are real trades, not
+    stale data -- a broker showing $1,809 after-hours while our regular-
+    session close was $1,775 is not a discrepancy, it's us ignoring real
+    volume. So we gather every session price Yahoo tracks (regular, post-
+    market, pre-market) along with its own timestamp, plus an independent
+    prepost-inclusive intraday bar, and always return whichever reading is
+    the most recently timestamped -- never frozen at the prior regular
+    close just because the market closed.
     """
     tk = yf.Ticker(symbol)
 
-    snapshot_price = None
     previous_close = None
     day_high = day_low = volume = avg_volume = None
-
     try:
         fast_info = tk.fast_info
-        snapshot_price = fast_info.get("lastPrice") or fast_info.get("last_price")
         previous_close = fast_info.get("previousClose") or fast_info.get("previous_close")
         day_high = fast_info.get("dayHigh")
         day_low = fast_info.get("dayLow")
@@ -54,43 +57,67 @@ def get_quote(symbol: str) -> Quote | None:
     except Exception:
         pass
 
-    if snapshot_price is None:
-        try:
-            info = tk.info
-            snapshot_price = info.get("currentPrice") or info.get("regularMarketPrice")
-            previous_close = previous_close or info.get("previousClose")
-        except Exception:
-            pass
+    candidates: list[tuple[datetime, float]] = []
+    try:
+        info = tk.info
+        previous_close = previous_close or info.get("previousClose")
+        for price_key, time_key in (
+            ("regularMarketPrice", "regularMarketTime"),
+            ("postMarketPrice", "postMarketTime"),
+            ("preMarketPrice", "preMarketTime"),
+        ):
+            price_val = info.get(price_key)
+            time_val = info.get(time_key)
+            if price_val is not None and time_val:
+                candidates.append((datetime.fromtimestamp(time_val, tz=timezone.utc), float(price_val)))
+    except Exception:
+        pass
 
-    # Independent, timestamped reading -- the source of truth for "as_of"
-    # and the cross-check for the snapshot price above.
+    # Independent, timestamped reading (prepost=True so it captures
+    # extended-hours bars too) -- both a cross-check for whichever session
+    # price wins above, and a fallback if `.info` had nothing.
     intraday_price = None
     intraday_as_of = None
     try:
-        intraday = tk.history(period="2d", interval="1m")
+        intraday = tk.history(period="2d", interval="1m", prepost=True)
         if intraday is not None and not intraday.empty:
             intraday_price = float(intraday["Close"].iloc[-1])
             ts = intraday.index[-1].to_pydatetime()
             intraday_as_of = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            candidates.append((intraday_as_of, intraday_price))
     except Exception:
         pass
 
-    price = snapshot_price if snapshot_price is not None else intraday_price
-    as_of = intraday_as_of
-    cross_check_price = intraday_price if (snapshot_price is not None and intraday_price is not None) else None
-
-    if price is None:
+    if not candidates:
         try:
-            daily = tk.history(period="5d", interval="1d")
-            if daily is not None and not daily.empty:
-                price = float(daily["Close"].iloc[-1])
-                ts = daily.index[-1].to_pydatetime()
-                as_of = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            fast_info = tk.fast_info
+            fallback_price = fast_info.get("lastPrice") or fast_info.get("last_price")
+            if fallback_price is not None:
+                candidates.append((None, float(fallback_price)))
         except Exception:
             pass
 
-    if price is None:
+    as_of = None
+    if not candidates:
+        try:
+            daily = tk.history(period="5d", interval="1d")
+            if daily is not None and not daily.empty:
+                ts = daily.index[-1].to_pydatetime()
+                as_of = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                candidates.append((as_of, float(daily["Close"].iloc[-1])))
+        except Exception:
+            pass
+
+    if not candidates:
         return None
+
+    timestamped = [c for c in candidates if c[0] is not None]
+    if timestamped:
+        as_of, price = max(timestamped, key=lambda c: c[0])
+    else:
+        as_of, price = None, candidates[0][1]
+
+    cross_check_price = intraday_price if (intraday_price is not None and intraday_price != price) else None
 
     return Quote(
         symbol=symbol,
