@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 import discord
 from discord import app_commands
@@ -190,15 +191,37 @@ async def setrisk_cmd(interaction: discord.Interaction, percent: float) -> None:
 
 @client.event
 async def on_ready():
-    await client.tree.sync()
+    # on_ready fires again on every reconnect/resume -- only sync the command
+    # tree once per process to avoid burning Discord's tight sync rate limits.
+    if not getattr(client, "_commands_synced", False):
+        await client.tree.sync()
+        client._commands_synced = True
     alerts.register_background_tasks(client)
     print("Bot is online")
     print(f"Logged in as {client.user}")
     logger.info("Bot online as %s. Configured providers: %s", client.user, __import__("apis.router", fromlist=["configured_providers"]).configured_providers())
 
 
+RATE_LIMIT_RETRY_SECONDS = 300  # Cloudflare 1015 bans are temporary; retry every 5 min.
+
+
 def main() -> None:
-    client.run(TOKEN)
+    try:
+        client.run(TOKEN)
+    except discord.HTTPException as exc:
+        if exc.status == 429:
+            # Discord/Cloudflare is temporarily rate-limiting this IP (error
+            # 1015), usually after several restarts in a short window. This is
+            # not a code failure: wait it out, then replace this process with
+            # a fresh one so the login retries cleanly. One attempt per 5
+            # minutes will not extend the ban.
+            logger.warning(
+                "Discord rate-limited the login (temporary Cloudflare IP ban). "
+                "Retrying in %d seconds...", RATE_LIMIT_RETRY_SECONDS,
+            )
+            time.sleep(RATE_LIMIT_RETRY_SECONDS)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        raise
 
 
 if __name__ == "__main__":
