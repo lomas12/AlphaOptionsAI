@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "AlphaOptionsAI"
+version = "1.0.0"
+id = "artifacts/alphaoptionsai"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23988
+
+[services.development]
+run = "pnpm --filter @workspace/alphaoptionsai run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/alphaoptionsai", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/alphaoptionsai/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23988"
+BASE_PATH = "/"

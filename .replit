@@ -2,7 +2,10 @@ modules = ["nodejs-24", "python-3.12"]
 
 [deployment]
 router = "application"
-deploymentTarget = "autoscale"
+# Reserved VM: the AlphaOptionsAI Discord bot needs an always-on process
+# (persistent Discord gateway connection) -- autoscale would suspend it
+# between requests and knock the bot offline.
+deploymentTarget = "vm"
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]

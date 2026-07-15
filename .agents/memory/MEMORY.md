@@ -1,2 +1,3 @@
 - [discord.py tasks.loop daily scheduling](discord-tasks-loop-daily.md) — use `time=` param for once-daily jobs, not `hours=24` (fires immediately on every restart).
 - [AlphaOptionsAI trade engine design](alphaoptionsai-trade-engine.md) — self-learning confidence scoring architecture and data-source fallbacks for the Discord options bot.
+- [Publishing non-artifact processes](publishing-non-artifact-processes.md) — publish gate needs a web artifact; bot rides along with api-server prod service on a Reserved VM.
