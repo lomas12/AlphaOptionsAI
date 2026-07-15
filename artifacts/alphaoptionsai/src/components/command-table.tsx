@@ -1,16 +1,16 @@
 const commands = [
-  { cmd: "/scan", args: "[ticker]", desc: "Full fundamental and technical scan returning Call, Put, or No Trade." },
-  { cmd: "/options", args: "[ticker]", desc: "Raw options chain analysis, unusual volume, and IV skew." },
-  { cmd: "/news", args: "[ticker]", desc: "Sentiment analysis of the last 24h of verified news sources." },
-  { cmd: "/backtest", args: "[ticker] [strategy]", desc: "Run a historical backtest of a strategy on a specific ticker." },
+  { cmd: "/scan", args: "[ticker]", desc: "Full technical and options scan returning one decision: Call, Put, or No Trade." },
+  { cmd: "/options", args: "[ticker]", desc: "Options chain analysis: greeks, IV rank, max pain, and put/call ratio." },
+  { cmd: "/news", args: "[ticker]", desc: "Latest verified headlines, analyst actions, insider activity, and SEC filings." },
+  { cmd: "/backtest", args: "[ticker] [period]", desc: "Backtest the EMA crossover strategy on real historical prices." },
   { cmd: "/history", args: "[ticker]", desc: "View the bot's past recommendations and actual outcomes." },
-  { cmd: "/watchlist", args: "add/remove [ticker]", desc: "Manage tickers the bot monitors during market hours." },
-  { cmd: "/alerts", args: "start/stop", desc: "Toggle automatic high-conviction alerts for your watchlist." },
-  { cmd: "/setbalance", args: "[amount]", desc: "Set your paper or real portfolio balance for position sizing." },
+  { cmd: "/universe", args: "", desc: "Universal scanner status: optionable-stock universe size and top live candidates." },
+  { cmd: "/alerts", args: "", desc: "Show the most recent automatic high-conviction alerts." },
+  { cmd: "/setbalance", args: "[amount]", desc: "Set your account balance for position sizing." },
   { cmd: "/setrisk", args: "[percentage]", desc: "Set max risk per trade (e.g., 2%)." },
-  { cmd: "/performance", args: "", desc: "View the bot's global win rate and average return." },
-  { cmd: "/top", args: "", desc: "View the highest scoring setups in the market right now." },
-  { cmd: "/earnings", args: "[ticker]", desc: "Upcoming earnings data, historical moves, and implied volatility." },
+  { cmd: "/performance", args: "", desc: "Accuracy breakdown of past recommendations by ticker." },
+  { cmd: "/top", args: "", desc: "Leaderboard of the best-performing strategy setups so far." },
+  { cmd: "/earnings", args: "[ticker]", desc: "Upcoming earnings date, days remaining, and EPS / revenue estimates." },
 ];
 
 export function CommandTable() {

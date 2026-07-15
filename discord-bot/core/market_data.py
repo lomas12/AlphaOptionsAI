@@ -48,6 +48,12 @@ class VerifiedQuote:
     as_of: datetime  # UTC, always present on a verified quote
 
 
+def is_us_market_hours(now: datetime | None = None) -> bool:
+    """Public helper: True during regular US equity trading hours
+    (weekdays 9:30-16:00 America/New_York)."""
+    return _is_market_hours(now or datetime.now(timezone.utc))
+
+
 def _is_market_hours(now_utc: datetime) -> bool:
     now_et = now_utc.astimezone(NY_TZ)
     if now_et.weekday() >= 5:

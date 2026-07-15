@@ -164,6 +164,20 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS symbol_universe (
+                symbol TEXT PRIMARY KEY,
+                name TEXT,
+                exchange TEXT,
+                is_etf INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
         existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendations)").fetchall()}
         for column, ddl in (
             ("sector", "ALTER TABLE recommendations ADD COLUMN sector TEXT"),
@@ -346,6 +360,91 @@ def get_watchlist(name: str = "default") -> list[str]:
     with _connect() as conn:
         row = conn.execute("SELECT tickers FROM watchlists WHERE name = ?", (name,)).fetchone()
         return json.loads(row["tickers"]) if row else []
+
+
+# --- Symbol universe (universal market scanner) ---------------------------
+
+
+def replace_universe(rows: list[tuple[str, Optional[str], Optional[str], bool, str]]) -> tuple[int, int, int]:
+    """Upsert the full optionable universe in one transaction.
+
+    ``rows`` is (symbol, name, exchange, is_etf, source). Symbols missing
+    from ``rows`` are marked inactive (delisted/no longer optionable), NOT
+    deleted, so history and first_seen dates survive. Returns
+    (added, deactivated, total_active).
+    """
+    now = _utcnow()
+    incoming = {r[0] for r in rows}
+    with _connect() as conn:
+        existing = {row["symbol"] for row in conn.execute("SELECT symbol FROM symbol_universe").fetchall()}
+        previously_active = {
+            row["symbol"] for row in conn.execute("SELECT symbol FROM symbol_universe WHERE active = 1").fetchall()
+        }
+        conn.executemany(
+            """
+            INSERT INTO symbol_universe (symbol, name, exchange, is_etf, source, first_seen, last_seen, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(symbol) DO UPDATE SET
+                name = excluded.name, exchange = excluded.exchange, is_etf = excluded.is_etf,
+                source = excluded.source, last_seen = excluded.last_seen, active = 1
+            """,
+            [(s, n, e, 1 if etf else 0, src, now, now) for s, n, e, etf, src in rows],
+        )
+        if incoming:
+            placeholders = ",".join("?" for _ in incoming)
+            conn.execute(
+                f"UPDATE symbol_universe SET active = 0 WHERE symbol NOT IN ({placeholders})",
+                tuple(incoming),
+            )
+        added = len(incoming - existing)
+        deactivated = len(previously_active - incoming)
+        return added, deactivated, len(incoming)
+
+
+def add_universe_symbol(symbol: str, name: Optional[str], exchange: Optional[str], is_etf: bool, source: str) -> None:
+    """Add one symbol discovered outside a bulk refresh (e.g. verified live
+    during /scan) so it participates in future scans."""
+    now = _utcnow()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO symbol_universe (symbol, name, exchange, is_etf, source, first_seen, last_seen, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(symbol) DO UPDATE SET last_seen = excluded.last_seen, active = 1
+            """,
+            (symbol, name, exchange, 1 if is_etf else 0, source, now, now),
+        )
+
+
+def get_universe_symbols(active_only: bool = True) -> list[str]:
+    query = "SELECT symbol FROM symbol_universe"
+    if active_only:
+        query += " WHERE active = 1"
+    query += " ORDER BY symbol"
+    with _connect() as conn:
+        return [row["symbol"] for row in conn.execute(query).fetchall()]
+
+
+def is_in_universe(symbol: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute("SELECT 1 FROM symbol_universe WHERE symbol = ? AND active = 1", (symbol,)).fetchone()
+        return row is not None
+
+
+@dataclass
+class UniverseStats:
+    active: int
+    inactive: int
+    etfs: int
+    last_refresh_utc: Optional[str]
+
+
+def get_universe_stats() -> UniverseStats:
+    with _connect() as conn:
+        active = conn.execute("SELECT COUNT(*) AS c FROM symbol_universe WHERE active = 1").fetchone()["c"]
+        inactive = conn.execute("SELECT COUNT(*) AS c FROM symbol_universe WHERE active = 0").fetchone()["c"]
+        etfs = conn.execute("SELECT COUNT(*) AS c FROM symbol_universe WHERE active = 1 AND is_etf = 1").fetchone()["c"]
+    return UniverseStats(active=active, inactive=inactive, etfs=etfs, last_refresh_utc=get_setting("universe_last_refresh_utc"))
 
 
 @dataclass

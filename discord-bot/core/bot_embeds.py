@@ -218,9 +218,47 @@ def build_earnings_embed(ticker: str, earnings_ctx) -> discord.Embed:
     return embed
 
 
-def build_watchlist_embed() -> discord.Embed:
-    tickers = database.get_watchlist()
-    embed = discord.Embed(title="📋 AlphaOptionsAI Watchlist", description="\n".join(tickers), color=discord.Color.blurple())
+def build_universe_embed() -> discord.Embed:
+    from core import alerts as alerts_module  # local import: alerts pulls in bot_embeds lazily too
+
+    stats = database.get_universe_stats()
+    state = alerts_module.get_scanner_state()
+    embed = discord.Embed(title="🌐 Universal Market Scanner", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+
+    if stats.active == 0:
+        embed.description = (
+            "Universe not built yet — the first refresh from the official NASDAQ and CBOE "
+            "directories is still pending. No symbols will be scanned until real listings are loaded."
+        )
+        return embed
+
+    refresh_display = UNAVAILABLE
+    if stats.last_refresh_utc:
+        try:
+            refresh_display = datetime.fromisoformat(stats.last_refresh_utc).strftime("%Y-%m-%d %H:%M UTC")
+        except ValueError:
+            pass
+
+    embed.description = (
+        f"Dynamically maintained universe of **{stats.active:,}** optionable US symbols "
+        f"(incl. {stats.etfs:,} ETFs) built from official NASDAQ + CBOE directories — no hardcoded watchlist."
+    )
+    embed.add_field(name="Universe", value=f"{stats.active:,} active / {stats.inactive:,} retired", inline=True)
+    embed.add_field(name="Last Refresh", value=refresh_display, inline=True)
+    embed.add_field(name="Market", value="🟢 Open — sweeping" if state.market_open else "⚪ Closed — scanner paused", inline=True)
+
+    if state.hot_candidates:
+        lines = [
+            f"`{c.symbol:<5}` ${c.price:,.2f} · {c.change_pct:+.1f}% · vol {c.volume_ratio:.1f}x"
+            for c in state.hot_candidates[:10]
+        ]
+        swept = state.last_sweep_at.strftime("%H:%M UTC") if state.last_sweep_at else UNAVAILABLE
+        embed.add_field(name=f"Top Candidates (live prescreen, {swept})", value="\n".join(lines), inline=False)
+    else:
+        note = "No sweep completed yet this session."
+        if not state.market_open:
+            note += " The scanner resumes at US market open."
+        embed.add_field(name="Top Candidates", value=note, inline=False)
     return embed
 
 

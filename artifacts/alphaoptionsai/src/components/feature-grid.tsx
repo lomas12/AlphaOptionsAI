@@ -26,7 +26,7 @@ const features = [
   },
   {
     title: "Automated Alerts",
-    desc: "Background scanner watches your watchlist 24/7 during market hours, posting setups that score 80+ to a dedicated #trade-alerts channel.",
+    desc: "Background scanner sweeps the entire optionable US stock universe during market hours, posting setups that score 80+ to a dedicated #trade-alerts channel.",
     icon: "∿"
   }
 ];

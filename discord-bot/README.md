@@ -74,7 +74,7 @@ Optional (enable a premium provider — see table above).
 | `/options <ticker>` | Options-chain analysis: greeks, IV rank, max pain, put/call ratio |
 | `/news <ticker>` | News, sentiment, analyst actions, insider activity, SEC filings |
 | `/earnings <ticker>` | Next earnings date and estimates |
-| `/watchlist` | Tickers the 5-minute auto-scanner watches |
+| `/universe` | Universal scanner status: optionable-universe size, last refresh, top live candidates |
 | `/history [ticker]` | Recent recommendations |
 | `/performance` | Accuracy breakdown by ticker |
 | `/stats` | Overall win rate and performance stats |
@@ -86,11 +86,20 @@ Optional (enable a premium provider — see table above).
 
 ## Background jobs
 
-- **5-minute scanner** — runs `/scan`-equivalent analysis across the
-  watchlist; only posts to a channel named `#trade-alerts` when confidence
-  ≥ 85%, liquidity ≥ 60, and risk/reward ≥ 2:1. If no `#trade-alerts`
-  channel exists in any joined server, it logs a warning and skips
-  posting (create the channel to receive alerts).
+- **Universal market scanner (every 10 min, market hours)** — no hardcoded
+  watchlist. The bot maintains a universe of every optionable US stock
+  (official NASDAQ symbol directories ∩ CBOE options directory, refreshed
+  daily at 08:15 UTC and cached in SQLite). Each cycle it prescreens a
+  rotating 400-symbol slice with batched bulk downloads (price, %-change,
+  volume-surge, dollar-volume floors — real bars only), keeps a ranked hot
+  list across cycles, and runs the full V4 decision engine on the top 8
+  fresh candidates. Only posts to a channel named `#trade-alerts` when the
+  trade score is ≥ 80, liquidity ≥ 60, and risk/reward ≥ 2:1. If no
+  `#trade-alerts` channel exists in any joined server, it logs a warning
+  and skips posting (create the channel to receive alerts). If the symbol
+  sources are unreachable, the scanner runs on the cached universe — and
+  if no cache exists yet it skips the sweep and says so rather than
+  scanning an invented list.
 - **15-minute monitor** — re-prices every open recommendation's contract
   and closes it as a WIN or LOSS when it hits its take-profit, stop-loss,
   or expiration, feeding the result back into the self-learning strategy

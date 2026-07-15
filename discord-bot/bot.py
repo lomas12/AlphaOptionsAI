@@ -5,7 +5,7 @@ import time
 import discord
 from discord import app_commands
 
-from core import ai_engine, alerts, backtester as backtester_module, bot_embeds, database, market_data as market_data_module, portfolio as portfolio_module
+from core import ai_engine, alerts, backtester as backtester_module, bot_embeds, database, market_data as market_data_module, portfolio as portfolio_module, universe as universe_module
 from core.logging_config import get_logger
 
 logger = get_logger("bot")
@@ -38,8 +38,15 @@ async def ping(interaction: discord.Interaction) -> None:
 @app_commands.describe(ticker="Stock ticker symbol to scan, e.g. ORCL")
 async def scan(interaction: discord.Interaction, ticker: str) -> None:
     await interaction.response.defer()
+    # Validate against the optionable-US-stock universe before spending any
+    # analysis calls. deep=True gives unknown symbols one live options-chain
+    # check, so brand-new listings still work.
+    validation = await universe_module.validate_symbol(ticker, deep=True)
+    if not validation.ok:
+        await interaction.followup.send(f"❌ {validation.reason}")
+        return
     try:
-        decision = await ai_engine.analyze_ticker(ticker)
+        decision = await ai_engine.analyze_ticker(validation.symbol)
     except ai_engine.TickerNotFoundError as exc:
         await interaction.followup.send(str(exc))
         return
@@ -111,9 +118,9 @@ async def earnings_cmd(interaction: discord.Interaction, ticker: str) -> None:
     await interaction.followup.send(embed=bot_embeds.build_earnings_embed(symbol, earnings_ctx))
 
 
-@client.tree.command(name="watchlist", description="Show the automatic 5-minute scanner's watchlist")
-async def watchlist_cmd(interaction: discord.Interaction) -> None:
-    await interaction.response.send_message(embed=bot_embeds.build_watchlist_embed())
+@client.tree.command(name="universe", description="Universal scanner status: optionable-stock universe size, last refresh, and top live candidates")
+async def universe_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(embed=bot_embeds.build_universe_embed())
 
 
 @client.tree.command(name="history", description="Show AlphaOptionsAI's most recent recommendations")

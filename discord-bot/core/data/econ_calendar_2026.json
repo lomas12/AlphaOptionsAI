@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-07-15T04:45:00+00:00",
+  "note": "Static events below were parsed from official government schedule pages on the date above. Treasury auction dates are fetched live at runtime from treasurydirect.gov and are NOT stored here.",
+  "sources": {
+    "FOMC": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm (fetched + parsed 2026-07-15)"
+  },
+  "untracked": [
+    {"name": "CPI", "reason": "bls.gov schedule pages block automated access from this server -- release dates cannot be verified, so they are not shown rather than guessed", "source": "https://www.bls.gov/schedule/news_release/cpi.htm"},
+    {"name": "PPI", "reason": "bls.gov blocks automated access -- dates not verifiable", "source": "https://www.bls.gov/schedule/news_release/ppi.htm"},
+    {"name": "Jobs Report (Employment Situation)", "reason": "bls.gov blocks automated access -- dates not verifiable", "source": "https://www.bls.gov/schedule/news_release/empsit.htm"},
+    {"name": "GDP / PCE (BEA)", "reason": "bea.gov schedule page could not be parsed reliably -- dates not verifiable", "source": "https://www.bea.gov/news/schedule"},
+    {"name": "Retail Sales (Census)", "reason": "schedule source not verified from this server", "source": "https://www.census.gov/retail/marts/about_the_surveys.html"},
+    {"name": "Consumer Confidence (Conference Board)", "reason": "schedule behind a commercial site -- not verified", "source": "https://www.conference-board.org/topics/consumer-confidence"}
+  ],
+  "events": [
+    {"date": "2026-07-28", "end_date": "2026-07-29", "name": "FOMC Meeting (rate decision Jul 29)", "category": "FOMC"},
+    {"date": "2026-09-15", "end_date": "2026-09-16", "name": "FOMC Meeting (rate decision Sep 16, with projections)", "category": "FOMC"},
+    {"date": "2026-10-27", "end_date": "2026-10-28", "name": "FOMC Meeting (rate decision Oct 28)", "category": "FOMC"},
+    {"date": "2026-12-08", "end_date": "2026-12-09", "name": "FOMC Meeting (rate decision Dec 9, with projections)", "category": "FOMC"}
+  ]
+}
