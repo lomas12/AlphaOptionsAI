@@ -1,4 +1,4 @@
-"""Discord embed builders for AlphaOptionsAI V3."""
+"""Discord embed builders for AlphaOptionsAI V4."""
 
 from datetime import datetime, timezone
 
@@ -11,6 +11,8 @@ COLOR_PUT = discord.Color.red()
 COLOR_NEUTRAL = discord.Color.light_grey()
 
 UNAVAILABLE = "Data unavailable from API"
+
+VERIFIED_DATA_UNAVAILABLE_MESSAGE = "Verified market data unavailable. No recommendation generated."
 
 
 def _fmt(value, suffix: str = "", decimals: int = 2) -> str:
@@ -33,13 +35,32 @@ def build_trade_decision_embed(decision: ai_engine.TradeDecision) -> discord.Emb
     banner = {"BUY CALL": "🟢 BUY CALL", "BUY PUT": "🔴 BUY PUT", "NO TRADE": "⚪ NO TRADE"}[decision.recommendation]
 
     as_of_text = decision.price_as_of.strftime("%Y-%m-%d %H:%M:%S UTC") if decision.price_as_of else "unknown"
+    title = f"{decision.ticker} — {banner}"
+    if decision.trade_grade:
+        title += f"  [{decision.trade_grade}]"
     embed = discord.Embed(
-        title=f"{decision.ticker} — {banner}",
+        title=title,
         description=f"Current Price: **${decision.price:.2f}**  (source: {decision.price_source}, as of {as_of_text})",
         color=_color_for(decision.recommendation),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Confidence", value=f"{decision.confidence:.1f}%", inline=True)
+
+    # Confidence breakdown -- category-by-category, not just one number.
+    if decision.score_breakdown:
+        b = decision.score_breakdown
+        embed.add_field(
+            name="Confidence Breakdown",
+            value=(
+                f"Trend: {b.trend:+.1f} | Momentum: {b.momentum:+.1f} | Volume: {b.volume:+.1f}\n"
+                f"Market: {b.market:+.1f} | News: {b.news:+.1f} | Options Data: {b.options_data:+.1f}\n"
+                f"Risk: {b.risk:+.1f}\n"
+                f"**Final Confidence: {decision.confidence:.1f}%**"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Confidence", value=f"{decision.confidence:.1f}%", inline=True)
+
     if decision.risk_rating:
         embed.add_field(name="Risk Rating", value=decision.risk_rating, inline=True)
     if decision.chain_analysis and decision.chain_analysis.expected_move:
@@ -49,66 +70,88 @@ def build_trade_decision_embed(decision: ai_engine.TradeDecision) -> discord.Emb
             inline=True,
         )
 
-    embed.add_field(name="Reasoning", value="\n".join(f"• {r}" for r in decision.reasoning[:8]), inline=False)
+    embed.add_field(name="Reasoning", value="\n".join(f"• {r}" for r in decision.reasoning[:8]) or "—", inline=False)
 
     if decision.contract:
         c = decision.contract
         embed.add_field(
-            name="Recommended Contract",
+            name="Option Quality — Recommended Contract",
             value=(
                 f"{c['option_type']} ${c['strike']} exp {c['expiration']} ({c['dte']}d)\n"
-                f"Premium: ${c['premium']:.2f} | IV: {c['implied_vol']*100:.1f}% | OI: {c['open_interest']} | Vol: {c['volume']}\n"
+                f"Premium: ${c['premium']:.2f} | Bid/Ask: ${c['bid']:.2f}/${c['ask']:.2f} (spread {c['spread_pct']:.1f}%)\n"
+                f"OI: {c['open_interest']} | Volume: {c['volume']}\n"
+                f"IV: {c['implied_vol']*100:.1f}% | IV Rank: {_fmt(c['iv_rank'], '%', 1)} | IV Percentile: {_fmt(c['iv_percentile'], '%', 1)}\n"
                 f"Δ {c['delta']:.3f} | Γ {c['gamma']:.4f} | Θ {c['theta']:.3f} | Vega {c['vega']:.3f}\n"
-                f"Probability ITM: {c['probability_itm']:.1f}%"
+                f"Probability ITM: {c['probability_itm']:.1f}% | Composite Score: {c['composite_score']:.1f}"
                 + (" | ⚡ Unusual Activity" if c["unusual_activity"] else "")
             ),
             inline=False,
         )
         embed.add_field(
-            name="Trade Plan",
+            name="Trade Plan & Risk",
             value=(
                 f"Entry: ${decision.entry:.2f}\n"
-                f"TP1: ${decision.take_profit_1:.2f} | TP2: ${decision.take_profit_2:.2f}\n"
-                f"Stop Loss: ${decision.stop_loss:.2f}\n"
+                f"TP1: ${decision.take_profit_1:.2f} | TP2: ${decision.take_profit_2:.2f} | Stop Loss: ${decision.stop_loss:.2f}\n"
                 f"Risk/Reward: {decision.risk_reward_ratio}:1\n"
-                f"Dollar Risk/Contract: ${decision.dollar_risk_per_contract:.2f}\n"
-                f"Suggested Size: {decision.position_size_contracts} contract(s) "
-                f"(2% of ${decision.account_balance:,.0f} account)"
+                f"Position Size: {decision.position_size_contracts} contract(s) "
+                f"({round((decision.risk_pct_used or 0) * 100, 1)}% of ${decision.account_balance:,.0f} account)\n"
+                f"Max $ Risk: ${decision.max_risk_dollars:.2f} | Expected Reward: ${decision.expected_reward_dollars or 0:.2f}"
             ),
             inline=False,
         )
-    elif decision.recommendation == "NO TRADE" and decision.chain_analysis:
-        best_call = max(decision.chain_analysis.calls, key=lambda c: c.liquidity_score, default=None)
-        best_put = max(decision.chain_analysis.puts, key=lambda p: p.liquidity_score, default=None)
-        alt_lines = []
-        if best_call:
-            alt_lines.append(f"CALL ${best_call.contract.strike} exp {best_call.contract.expiration} -- liquidity {best_call.liquidity_score}")
-        if best_put:
-            alt_lines.append(f"PUT ${best_put.contract.strike} exp {best_put.contract.expiration} -- liquidity {best_put.liquidity_score}")
-        if alt_lines:
-            embed.add_field(name="Alternative Trade (below 70% confidence)", value="\n".join(alt_lines), inline=False)
+    elif decision.rejected_contracts:
+        embed.add_field(
+            name="Smart Contract Filter",
+            value="\n".join(f"• {r}" for r in decision.rejected_contracts[:5]),
+            inline=False,
+        )
+
+    if decision.backtest:
+        bt = decision.backtest
+        embed.add_field(
+            name="Historical Backtest",
+            value=(
+                f"Occurrences: {bt.total_trades} | Wins: {bt.winning_trades} | Losses: {bt.losing_trades}\n"
+                f"Win Rate: {_fmt(bt.win_rate, '%', 1)} | Avg Gain: {_fmt(bt.avg_gain_pct, '%', 2)} | Avg Loss: {_fmt(bt.avg_loss_pct, '%', 2)}\n"
+                f"Avg Hold: {_fmt(bt.avg_hold_days, 'd', 1)} | Period: {bt.period}"
+                + ("" if bt.production_ready else " | ⚠️ small sample")
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Historical Backtest", value="Not enough historical occurrences to backtest this setup.", inline=False)
 
     if decision.chain_analysis:
         ca = decision.chain_analysis
         embed.add_field(
             name="Options Context",
             value=(
-                f"Max Pain: {_fmt(ca.max_pain, '$', 2) if ca.max_pain is None else f'${ca.max_pain:.2f}'}\n"
-                f"Put/Call Ratio: {_fmt(ca.put_call_ratio)}\n"
-                f"IV Rank: {_fmt(ca.iv_rank, '%', 1)} | IV Percentile: {_fmt(ca.iv_percentile, '%', 1)}"
+                f"Max Pain: {'N/A' if ca.max_pain is None else f'${ca.max_pain:.2f}'}\n"
+                f"Put/Call Ratio: {_fmt(ca.put_call_ratio)}"
             ),
             inline=False,
         )
 
     market = decision.market
     sentiment = decision.news_context.news_sentiment or "N/A"
-    footer_lines = [
-        f"SPY {market.spy_trend or 'N/A'} | QQQ {market.qqq_trend or 'N/A'} | VIX {_fmt(market.vix_level, '', 1)} ({market.vix_classification or 'N/A'})",
-        f"News sentiment: {sentiment}",
-    ]
+    embed.add_field(
+        name="Market Context",
+        value=(
+            f"SPY {market.spy_trend or 'N/A'} | QQQ {market.qqq_trend or 'N/A'} | "
+            f"VIX {_fmt(market.vix_level, '', 1)} ({market.vix_classification or 'N/A'})\n"
+            f"News Sentiment: {sentiment}"
+        ),
+        inline=False,
+    )
+
+    if decision.ai_summary:
+        embed.add_field(name="AI Summary", value=decision.ai_summary, inline=False)
+
+    footer_lines = []
     if decision.missing_data:
         footer_lines.append(f"Unavailable: {', '.join(decision.missing_data)}")
-    embed.set_footer(text=" | ".join(footer_lines))
+    if footer_lines:
+        embed.set_footer(text=" | ".join(footer_lines))
     return embed
 
 
@@ -256,7 +299,10 @@ def build_backtest_embed(ticker: str, result) -> discord.Embed:
     embed.add_field(name="Period", value=result.period, inline=True)
     embed.add_field(name="Total Trades", value=str(result.total_trades), inline=True)
     embed.add_field(name="Production Ready", value="✅ Yes" if result.production_ready else f"⚠️ No (needs {backtester_module.MIN_TRADES_FOR_PRODUCTION}+ trades)", inline=True)
+    embed.add_field(name="Winning / Losing", value=f"{result.winning_trades} / {result.losing_trades}", inline=True)
     embed.add_field(name="Win Rate", value=_fmt(result.win_rate, "%", 1), inline=True)
+    embed.add_field(name="Avg Gain", value=_fmt(result.avg_gain_pct, "%", 2), inline=True)
+    embed.add_field(name="Avg Loss", value=_fmt(result.avg_loss_pct, "%", 2), inline=True)
     embed.add_field(name="Avg Return", value=_fmt(result.avg_return_pct, "%", 2), inline=True)
     embed.add_field(name="Avg Hold", value=_fmt(result.avg_hold_days, "d", 1), inline=True)
     embed.add_field(name="Max Drawdown", value=_fmt(result.max_drawdown_pct, "%", 2), inline=True)
@@ -271,8 +317,9 @@ def build_backtest_embed(ticker: str, result) -> discord.Embed:
 
 def build_market_data_unavailable_embed(ticker: str, reason: str) -> discord.Embed:
     embed = discord.Embed(
-        title=f"{ticker} — Market data unavailable",
+        title=f"{ticker} — {VERIFIED_DATA_UNAVAILABLE_MESSAGE}",
         description=(
+            f"**{VERIFIED_DATA_UNAVAILABLE_MESSAGE}**\n\n"
             "A verified, current price for this ticker could not be confirmed, "
             "so no trade recommendation was generated.\n\n"
             f"Reason: {reason}"

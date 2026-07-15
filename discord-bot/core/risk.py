@@ -18,9 +18,19 @@ class TradePlanRisk:
     max_risk_dollars: float
     position_size_contracts: int
     meets_min_risk_reward: bool
+    account_balance: float
+    risk_pct_used: float
+    expected_reward_per_contract: float
+    expected_reward_dollars: float
+    position_cost_dollars: float
 
 
-def build_trade_plan_risk(*, entry: float, account_balance: float = ACCOUNT_BALANCE_DEFAULT) -> TradePlanRisk:
+def build_trade_plan_risk(
+    *,
+    entry: float,
+    account_balance: float = ACCOUNT_BALANCE_DEFAULT,
+    risk_pct: float = MAX_ACCOUNT_RISK_PCT,
+) -> TradePlanRisk:
     # Stop at -50% (typical max loss guideline for a long option swing trade),
     # TP1/TP2 sized to clear the 2:1 minimum risk/reward with room to spare.
     take_profit_1 = round(entry * 2.20, 2)
@@ -32,10 +42,14 @@ def build_trade_plan_risk(*, entry: float, account_balance: float = ACCOUNT_BALA
     risk_reward_ratio = round(reward / risk, 2) if risk > 0 else 0.0
 
     dollar_risk_per_contract = round(risk * 100, 2)  # 1 contract = 100 shares
-    max_risk_dollars = round(account_balance * MAX_ACCOUNT_RISK_PCT, 2)
+    max_risk_dollars = round(account_balance * risk_pct, 2)
     position_size_contracts = (
         max(1, int(max_risk_dollars // dollar_risk_per_contract)) if dollar_risk_per_contract > 0 else 1
     )
+
+    expected_reward_per_contract = round(reward * 100, 2)
+    expected_reward_dollars = round(expected_reward_per_contract * position_size_contracts, 2)
+    position_cost_dollars = round(entry * 100 * position_size_contracts, 2)
 
     return TradePlanRisk(
         entry=entry,
@@ -47,4 +61,9 @@ def build_trade_plan_risk(*, entry: float, account_balance: float = ACCOUNT_BALA
         max_risk_dollars=max_risk_dollars,
         position_size_contracts=position_size_contracts,
         meets_min_risk_reward=risk_reward_ratio >= MIN_RISK_REWARD_RATIO,
+        account_balance=account_balance,
+        risk_pct_used=risk_pct,
+        expected_reward_per_contract=expected_reward_per_contract,
+        expected_reward_dollars=expected_reward_dollars,
+        position_cost_dollars=position_cost_dollars,
     )

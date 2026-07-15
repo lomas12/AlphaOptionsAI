@@ -156,6 +156,14 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(recommendations)").fetchall()}
         for column, ddl in (
             ("sector", "ALTER TABLE recommendations ADD COLUMN sector TEXT"),
@@ -178,6 +186,39 @@ def init_db() -> None:
                 _utcnow(),
             ),
         )
+
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def get_account_balance() -> Optional[float]:
+    raw = get_setting("account_balance")
+    return float(raw) if raw is not None else None
+
+
+def set_account_balance(balance: float) -> None:
+    set_setting("account_balance", str(balance))
+
+
+def get_risk_pct() -> Optional[float]:
+    raw = get_setting("risk_pct")
+    return float(raw) if raw is not None else None
+
+
+def set_risk_pct(pct: float) -> None:
+    set_setting("risk_pct", str(pct))
 
 
 def log_api_call(provider: str, capability: str, symbol: Optional[str], success: bool) -> None:

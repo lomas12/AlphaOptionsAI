@@ -18,12 +18,19 @@ from typing import Optional
 
 from apis import router
 from apis.yahoo import clean_ticker
-from core import database, earnings as earnings_module, market as market_module, market_data as market_data_module, news as news_module, options as options_module, risk as risk_module, technicals as technicals_module
+from core import (
+    backtester as backtester_module, database, earnings as earnings_module, market as market_module,
+    market_data as market_data_module, news as news_module, options as options_module, risk as risk_module,
+    scoring as scoring_module, technicals as technicals_module,
+)
 
 CONFIDENCE_TRADE_THRESHOLD = 70.0
+MIN_HISTORICAL_WIN_RATE = 60.0
 SECTOR_ETF_HINTS = market_module.SECTOR_ETFS
 
 MarketDataUnavailableError = market_data_module.MarketDataUnavailableError
+
+VERIFIED_DATA_UNAVAILABLE_MESSAGE = "Verified market data unavailable. No recommendation generated."
 
 
 class TickerNotFoundError(Exception):
@@ -57,6 +64,13 @@ class TradeDecision:
     missing_data: list[str]
     price_source: str
     price_as_of: datetime
+    score_breakdown: Optional[scoring_module.ScoreBreakdown] = None
+    trade_grade: Optional[str] = None
+    backtest: Optional[backtester_module.BacktestResult] = None
+    ai_summary: Optional[str] = None
+    risk_pct_used: Optional[float] = None
+    expected_reward_dollars: Optional[float] = None
+    rejected_contracts: list[str] = field(default_factory=list)
 
 
 _HEADWIND_TAGS = {
@@ -145,22 +159,25 @@ def _active_tags(
     if market.vix_classification == "Elevated":
         tags.append("vix_elevated")
 
+    # News/analyst/insider signals are side-aware: good news supports calls
+    # and is a headwind for puts, and vice versa -- a signal should never
+    # inflate both directions at once.
     if news_ctx.news_sentiment == "Positive":
-        tags.append("positive_news_sentiment" if bullish else "negative_news_sentiment" if False else "positive_news_sentiment")
+        tags.append("positive_news_sentiment" if bullish else "negative_news_sentiment")
     if news_ctx.news_sentiment == "Negative":
-        tags.append("negative_news_sentiment")
+        tags.append("negative_news_sentiment" if bullish else "positive_news_sentiment")
 
     if news_ctx.analyst_action and news_ctx.analyst_action.action == "Upgrade":
-        tags.append("analyst_upgrade")
+        tags.append("analyst_upgrade" if bullish else "analyst_downgrade")
     if news_ctx.analyst_action and news_ctx.analyst_action.action == "Downgrade":
-        tags.append("analyst_downgrade")
+        tags.append("analyst_downgrade" if bullish else "analyst_upgrade")
 
     buys = sum(1 for t in news_ctx.insider_transactions if "buy" in t.transaction_type.lower())
     sells = sum(1 for t in news_ctx.insider_transactions if "sale" in t.transaction_type.lower() or "sell" in t.transaction_type.lower())
     if buys > sells and buys > 0:
-        tags.append("insider_buying")
+        tags.append("insider_buying" if bullish else "insider_selling")
     if sells > buys and sells > 0:
-        tags.append("insider_selling")
+        tags.append("insider_selling" if bullish else "insider_buying")
 
     if earnings_ctx.days_to_earnings is not None and 0 <= earnings_ctx.days_to_earnings <= 30:
         tags.append("earnings_event_risk")
@@ -236,11 +253,26 @@ def _build_reasoning(tags: list[str], news_ctx: news_module.TickerNewsContext) -
     return reasoning
 
 
-async def analyze_ticker(raw_ticker: str, account_balance: float = risk_module.ACCOUNT_BALANCE_DEFAULT) -> TradeDecision:
-    return await asyncio.to_thread(_analyze_ticker_sync, raw_ticker, account_balance)
+def _resolve_account_settings(account_balance: Optional[float], risk_pct: Optional[float]) -> tuple[float, float]:
+    if account_balance is None:
+        saved_balance = database.get_account_balance()
+        account_balance = saved_balance if saved_balance is not None else risk_module.ACCOUNT_BALANCE_DEFAULT
+    if risk_pct is None:
+        saved_risk_pct = database.get_risk_pct()
+        risk_pct = saved_risk_pct if saved_risk_pct is not None else risk_module.MAX_ACCOUNT_RISK_PCT
+    return account_balance, risk_pct
 
 
-def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecision:
+async def analyze_ticker(
+    raw_ticker: str, account_balance: Optional[float] = None, risk_pct: Optional[float] = None,
+) -> TradeDecision:
+    return await asyncio.to_thread(_analyze_ticker_sync, raw_ticker, account_balance, risk_pct)
+
+
+def _analyze_ticker_sync(
+    raw_ticker: str, account_balance: Optional[float] = None, risk_pct: Optional[float] = None,
+) -> TradeDecision:
+    account_balance, risk_pct = _resolve_account_settings(account_balance, risk_pct)
     symbol = clean_ticker(raw_ticker)
     if not symbol:
         raise TickerNotFoundError(f"❌ Could not find ticker {raw_ticker!r}")
@@ -296,45 +328,82 @@ def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecisi
             position_size_contracts=None, risk_rating=None, tags=[], account_balance=account_balance,
             snapshot=snapshot, market=market, news_context=news_ctx, earnings_context=earnings_ctx,
             chain_analysis=None, missing_data=missing_data, price_source=price_source, price_as_of=price_as_of,
+            risk_pct_used=risk_pct,
         )
 
-    best_call = max(chain_analysis.calls, key=lambda c: c.liquidity_score)
-    best_put = max(chain_analysis.puts, key=lambda p: p.liquidity_score)
+    # Smart Contract Filter + composite ranking: pick the single best
+    # qualifying contract on each side (never both), auto-falling through
+    # to the next-best candidate when one is rejected for liquidity/spread/
+    # theta-decay/pre-earnings-IV reasons.
+    best_call, call_rejected = options_module.select_best_contract(
+        chain_analysis.calls, days_to_earnings=earnings_ctx.days_to_earnings
+    )
+    best_put, put_rejected = options_module.select_best_contract(
+        chain_analysis.puts, days_to_earnings=earnings_ctx.days_to_earnings
+    )
 
-    call_confidence = round((best_call.liquidity_score + call_conviction) / 2, 1)
-    put_confidence = round((best_put.liquidity_score + put_conviction) / 2, 1)
+    side_candidates: dict[str, tuple[options_module.ScoredContract, list[str]]] = {}
+    if best_call is not None:
+        side_candidates["call"] = (best_call, call_tags)
+    if best_put is not None:
+        side_candidates["put"] = (best_put, put_tags)
 
-    if earnings_ctx.days_to_earnings is not None and 0 <= earnings_ctx.days_to_earnings <= 7:
-        call_confidence = max(0.0, call_confidence - 8)
-        put_confidence = max(0.0, put_confidence - 8)
+    if not side_candidates:
+        return TradeDecision(
+            ticker=symbol, price=current_price, recommendation="NO TRADE", confidence=0.0,
+            reasoning=["No contract on either side survived the Smart Contract Filter "
+                       "(open interest, volume, spread, liquidity, or theta-decay thresholds)"],
+            contract=None, entry=None, take_profit_1=None, take_profit_2=None, stop_loss=None,
+            risk_reward_ratio=None, dollar_risk_per_contract=None, max_risk_dollars=None,
+            position_size_contracts=None, risk_rating=None, tags=[], account_balance=account_balance,
+            snapshot=snapshot, market=market, news_context=news_ctx, earnings_context=earnings_ctx,
+            chain_analysis=chain_analysis, missing_data=missing_data, price_source=price_source, price_as_of=price_as_of,
+            risk_pct_used=risk_pct, rejected_contracts=call_rejected + put_rejected,
+        )
 
-    if call_confidence >= put_confidence:
-        side, scored, tags, confidence = "call", best_call, call_tags, call_confidence
-    else:
-        side, scored, tags, confidence = "put", best_put, put_tags, put_confidence
+    # Backtest Engine: side-matched historical stats, folded into scoring
+    # and the NO-TRADE gate below. Best-effort -- if there isn't enough
+    # history, backtest stays None and simply contributes no signal.
+    backtests: dict[str, Optional[backtester_module.BacktestResult]] = {}
+    breakdowns: dict[str, scoring_module.ScoreBreakdown] = {}
+    for candidate_side, (scored, side_tags) in side_candidates.items():
+        bt = backtester_module.run_backtest(symbol, side=candidate_side)
+        backtests[candidate_side] = bt
+        breakdowns[candidate_side] = scoring_module.compute_score(
+            side=candidate_side, tags=side_tags, weights=weights, chain=chain_analysis,
+            candidate=scored, earnings_ctx=earnings_ctx, backtest=bt,
+        )
+
+    side = max(breakdowns, key=lambda s: breakdowns[s].final_score)
+    scored, tags = side_candidates[side]
+    breakdown = breakdowns[side]
+    backtest = backtests[side]
+    confidence = breakdown.final_score
+    rejected_contracts = call_rejected + put_rejected
 
     if scored.unusual_activity:
         tags = tags + ["unusual_options_activity"]
 
     reasoning = _build_reasoning(tags, news_ctx)
+    reasoning.extend(breakdown.notes)
 
-    if confidence < CONFIDENCE_TRADE_THRESHOLD:
-        return TradeDecision(
-            ticker=symbol, price=current_price, recommendation="NO TRADE", confidence=confidence,
-            reasoning=reasoning + ["Confidence below the 70% action threshold -- waiting for confirmation"],
-            contract=None, entry=None, take_profit_1=None, take_profit_2=None, stop_loss=None,
-            risk_reward_ratio=None, dollar_risk_per_contract=None, max_risk_dollars=None,
-            position_size_contracts=None, risk_rating=None, tags=tags, account_balance=account_balance,
-            snapshot=snapshot, market=market, news_context=news_ctx, earnings_context=earnings_ctx,
-            chain_analysis=chain_analysis, missing_data=missing_data, price_source=price_source, price_as_of=price_as_of,
-        )
+    other_side = "put" if side == "call" else "call"
+    other_score = breakdowns[other_side].final_score if other_side in breakdowns else 0.0
+
+    no_trade_reasons = _evaluate_no_trade(
+        confidence=confidence, backtest=backtest, side_score=confidence, other_score=other_score,
+        news_ctx=news_ctx, chain=chain_analysis, candidate=scored,
+    )
 
     contract = scored.contract
-    premium = (contract.bid + contract.ask) / 2 if contract.bid > 0 and contract.ask > 0 else contract.last_price
-    plan = risk_module.build_trade_plan_risk(entry=round(premium, 2), account_balance=account_balance)
-
+    premium = scored.premium if scored.premium > 0 else (
+        (contract.bid + contract.ask) / 2 if contract.bid > 0 and contract.ask > 0 else contract.last_price
+    )
+    plan = risk_module.build_trade_plan_risk(entry=round(premium, 2), account_balance=account_balance, risk_pct=risk_pct)
     if not plan.meets_min_risk_reward:
-        reasoning.append(f"Note: risk/reward of {plan.risk_reward_ratio}:1 is below the 2:1 minimum guideline")
+        no_trade_reasons.append(f"Risk/reward of {plan.risk_reward_ratio}:1 is below the 2:1 minimum")
+
+    grade = scoring_module.trade_grade(confidence)
 
     if contract.implied_vol > 0.75 or scored.dte <= 7 or "earnings_event_risk" in tags:
         risk_rating = "High"
@@ -342,6 +411,11 @@ def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecisi
         risk_rating = "Medium"
     else:
         risk_rating = "Low"
+
+    ai_summary = _build_ai_summary(
+        symbol=symbol, side=side, confidence=confidence, grade=grade, reasoning=reasoning,
+        backtest=backtest, plan=plan, no_trade=bool(no_trade_reasons),
+    )
 
     contract_dict = {
         "option_type": side.upper(),
@@ -359,7 +433,30 @@ def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecisi
         "probability_itm": scored.probability_itm,
         "liquidity_score": scored.liquidity_score,
         "unusual_activity": scored.unusual_activity,
+        "spread_pct": round(scored.spread_pct * 100, 2),
+        "bid": contract.bid,
+        "ask": contract.ask,
+        "iv_rank": chain_analysis.iv_rank,
+        "iv_percentile": chain_analysis.iv_percentile,
+        "expected_move": chain_analysis.expected_move,
+        "expected_move_pct": chain_analysis.expected_move_pct,
+        "composite_score": scored.composite_score,
     }
+
+    if no_trade_reasons:
+        return TradeDecision(
+            ticker=symbol, price=current_price, recommendation="NO TRADE", confidence=confidence,
+            reasoning=reasoning + [f"NO TRADE: {reason}" for reason in no_trade_reasons],
+            contract=contract_dict, entry=plan.entry, take_profit_1=plan.take_profit_1,
+            take_profit_2=plan.take_profit_2, stop_loss=plan.stop_loss, risk_reward_ratio=plan.risk_reward_ratio,
+            dollar_risk_per_contract=plan.dollar_risk_per_contract, max_risk_dollars=plan.max_risk_dollars,
+            position_size_contracts=plan.position_size_contracts, risk_rating=risk_rating, tags=tags,
+            account_balance=account_balance, snapshot=snapshot, market=market, news_context=news_ctx,
+            earnings_context=earnings_ctx, chain_analysis=chain_analysis, missing_data=missing_data,
+            price_source=price_source, price_as_of=price_as_of, score_breakdown=breakdown, trade_grade=grade,
+            backtest=backtest, ai_summary=ai_summary, risk_pct_used=risk_pct,
+            expected_reward_dollars=plan.expected_reward_dollars, rejected_contracts=rejected_contracts,
+        )
 
     return TradeDecision(
         ticker=symbol, price=current_price, recommendation=f"BUY {side.upper()}", confidence=confidence,
@@ -369,5 +466,79 @@ def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecisi
         position_size_contracts=plan.position_size_contracts, risk_rating=risk_rating, tags=tags,
         account_balance=account_balance, snapshot=snapshot, market=market, news_context=news_ctx,
         earnings_context=earnings_ctx, chain_analysis=chain_analysis, missing_data=missing_data,
-        price_source=price_source, price_as_of=price_as_of,
+        price_source=price_source, price_as_of=price_as_of, score_breakdown=breakdown, trade_grade=grade,
+        backtest=backtest, ai_summary=ai_summary, risk_pct_used=risk_pct,
+        expected_reward_dollars=plan.expected_reward_dollars, rejected_contracts=rejected_contracts,
     )
+
+
+def _evaluate_no_trade(
+    *, confidence: float, backtest: Optional[backtester_module.BacktestResult], side_score: float,
+    other_score: float, news_ctx: news_module.TickerNewsContext,
+    chain: options_module.ChainAnalysis, candidate: options_module.ScoredContract,
+) -> list[str]:
+    """Every trigger is explained -- NO TRADE never fires silently."""
+    reasons: list[str] = []
+
+    if confidence < CONFIDENCE_TRADE_THRESHOLD:
+        reasons.append(f"Confidence {confidence}% is below the {CONFIDENCE_TRADE_THRESHOLD}% action threshold")
+
+    if backtest is not None and backtest.win_rate is not None and backtest.win_rate < MIN_HISTORICAL_WIN_RATE:
+        reasons.append(
+            f"Historical win rate for this setup is only {backtest.win_rate}% "
+            f"(below the {MIN_HISTORICAL_WIN_RATE}% minimum, {backtest.total_trades} occurrences)"
+        )
+
+    if abs(side_score - other_score) < 8 and side_score < 75 and other_score < 75:
+        reasons.append(
+            f"Conflicting indicators -- call and put setups score within {round(abs(side_score - other_score), 1)} "
+            "points of each other with no clear edge"
+        )
+
+    if not news_ctx.news_items and news_ctx.news_sentiment is None:
+        reasons.append("No recent news available -- elevated uncertainty with no sentiment confirmation")
+
+    if chain.iv_rank is not None and chain.iv_rank > 85 and candidate.expected_return_score < 40:
+        reasons.append(
+            f"IV rank {chain.iv_rank}% is extreme relative to this contract's modest expected-return profile"
+        )
+
+    return reasons
+
+
+def _build_ai_summary(
+    *, symbol: str, side: str, confidence: float, grade: str, reasoning: list[str],
+    backtest: Optional[backtester_module.BacktestResult], plan: risk_module.TradePlanRisk, no_trade: bool,
+) -> str:
+    sentences: list[str] = []
+    direction = "bullish" if side == "call" else "bearish"
+
+    if no_trade:
+        sentences.append(
+            f"{symbol} scored {confidence}% ({grade}) on the {direction} side, but one or more risk gates blocked a trade."
+        )
+    else:
+        sentences.append(
+            f"{symbol} scores {confidence}% ({grade}) confidence for a {direction} setup, "
+            f"anchored by: {', '.join(reasoning[:2]) if reasoning else 'baseline technicals'}."
+        )
+
+    if backtest is not None and backtest.win_rate is not None:
+        sentences.append(
+            f"Historically, this side-matched setup won {backtest.win_rate}% of "
+            f"{backtest.total_trades} occurrences over the {backtest.period} lookback "
+            f"(avg hold {backtest.avg_hold_days} days)."
+        )
+    else:
+        sentences.append("Not enough historical occurrences of this exact setup to compute a reliable backtest.")
+
+    sentences.append(
+        f"Risk plan: {plan.risk_reward_ratio}:1 reward-to-risk, "
+        f"{plan.position_size_contracts} contract(s) risking ${plan.max_risk_dollars} "
+        f"({round(plan.risk_pct_used * 100, 1)}% of the ${plan.account_balance:,.0f} account)."
+    )
+
+    if len(reasoning) > 2:
+        sentences.append(f"Additional context: {'; '.join(reasoning[2:5])}.")
+
+    return " ".join(sentences)

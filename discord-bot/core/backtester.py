@@ -38,8 +38,12 @@ class BacktestResult:
     strategy_tag: str
     period: str
     total_trades: int
+    winning_trades: int
+    losing_trades: int
     win_rate: Optional[float]
     avg_return_pct: Optional[float]
+    avg_gain_pct: Optional[float]
+    avg_loss_pct: Optional[float]
     avg_hold_days: Optional[float]
     max_drawdown_pct: Optional[float]
     max_gain_pct: Optional[float]
@@ -49,6 +53,7 @@ class BacktestResult:
     expectancy: Optional[float]
     production_ready: bool
     methodology_note: str
+    side: Optional[str] = None
 
 
 def _theoretical_call_price(spot: float, strike: float, t_years: float, sigma: float) -> float:
@@ -66,7 +71,10 @@ def _theoretical_put_price(spot: float, strike: float, t_years: float, sigma: fl
     return call - spot + strike * math.exp(-RISK_FREE_RATE * t_years)
 
 
-def run_backtest(symbol: str, period: str = "5y", hold_days: int = 10, direction: str = "long_bias") -> Optional[BacktestResult]:
+def run_backtest(
+    symbol: str, period: str = "5y", hold_days: int = 10, direction: str = "long_bias",
+    side: Optional[str] = None,
+) -> Optional[BacktestResult]:
     """Simple, transparent EMA20/50 trend-following strategy: enter a
     call when EMA20 crosses above EMA50 (put on the inverse crossover),
     hold for `hold_days` trading days or exit at +30%/-45% on the modeled
@@ -130,19 +138,30 @@ def run_backtest(symbol: str, period: str = "5y", hold_days: int = 10, direction
                     "max_gain_pct": best_return * 100,
                     "max_drawdown_pct": worst_return * 100,
                     "hold_days": (j - i),
+                    "is_call": is_call,
                 }
             )
             i = j + 1
         else:
             i += 1
 
+    if side == "call":
+        trades = [t for t in trades if t["is_call"]]
+    elif side == "put":
+        trades = [t for t in trades if not t["is_call"]]
+
     if not trades:
         return None
 
     total = len(trades)
-    wins = sum(1 for t in trades if t["return_pct"] > 0)
+    winners = [t for t in trades if t["return_pct"] > 0]
+    losers = [t for t in trades if t["return_pct"] <= 0]
+    wins = len(winners)
+    losses = len(losers)
     win_rate = round(wins / total * 100, 1)
     avg_return = round(sum(t["return_pct"] for t in trades) / total, 2)
+    avg_gain = round(sum(t["return_pct"] for t in winners) / wins, 2) if wins else None
+    avg_loss = round(sum(t["return_pct"] for t in losers) / losses, 2) if losses else None
     avg_hold = round(sum(t["hold_days"] for t in trades) / total, 1)
     max_drawdown = round(min(t["max_drawdown_pct"] for t in trades), 2)
     max_gain = round(max(t["max_gain_pct"] for t in trades), 2)
@@ -161,10 +180,12 @@ def run_backtest(symbol: str, period: str = "5y", hold_days: int = 10, direction
 
     result = BacktestResult(
         ticker=symbol, strategy_tag="ema20_50_crossover", period=period, total_trades=total,
-        win_rate=win_rate, avg_return_pct=avg_return, avg_hold_days=avg_hold,
-        max_drawdown_pct=max_drawdown, max_gain_pct=max_gain, sharpe_ratio=sharpe,
+        winning_trades=wins, losing_trades=losses,
+        win_rate=win_rate, avg_return_pct=avg_return, avg_gain_pct=avg_gain, avg_loss_pct=avg_loss,
+        avg_hold_days=avg_hold, max_drawdown_pct=max_drawdown, max_gain_pct=max_gain, sharpe_ratio=sharpe,
         sortino_ratio=sortino, profit_factor=profit_factor, expectancy=expectancy,
         production_ready=total >= MIN_TRADES_FOR_PRODUCTION, methodology_note=METHODOLOGY_NOTE,
+        side=side,
     )
 
     database.record_backtest(

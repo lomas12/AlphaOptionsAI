@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 from core import ai_engine, database, risk as risk_module
 
-AUTO_POST_CONFIDENCE_THRESHOLD = 85.0
+AUTO_POST_CONFIDENCE_THRESHOLD = 80.0  # V4 scoring engine is stricter/more conservative than V3's
+# blended liquidity+conviction average, so the auto-post bar sits at "B+ or better" trade grade
+# (comfortably above the 70% action threshold) rather than V3's 85%.
 MIN_LIQUIDITY_SCORE = 60.0
 MAX_SPREAD_PCT = 0.15
 

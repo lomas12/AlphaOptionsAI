@@ -21,6 +21,14 @@ from apis.base import OptionContract
 RISK_FREE_RATE = 0.05
 NUM_EXPIRATIONS = 3
 
+# Smart Contract Filter thresholds -- a contract failing any of these is
+# rejected and the next-best qualifying contract is used instead.
+MIN_OPEN_INTEREST = 500
+MIN_VOLUME = 100
+MAX_SPREAD_PCT = 0.10
+MIN_LIQUIDITY_SCORE = 60.0
+MAX_THETA_DECAY_PCT = 0.05  # theta as a fraction of premium decayed per day
+
 
 @dataclass
 class ScoredContract:
@@ -34,6 +42,14 @@ class ScoredContract:
     liquidity_score: float
     vol_oi_ratio: float
     unusual_activity: bool
+    # Contract-ranking sub-scores (0-100 each), combined into composite_score.
+    expected_return_score: float = 0.0
+    risk_score: float = 0.0
+    probability_score: float = 0.0
+    greeks_score: float = 0.0
+    composite_score: float = 0.0
+    spread_pct: float = 0.0
+    premium: float = 0.0
 
 
 @dataclass
@@ -101,6 +117,89 @@ def _liquidity_score(*, open_interest, volume, implied_vol, bid, ask, distance_p
     return _clamp(sum(factors) / len(factors)) * 100
 
 
+def _expected_return_score(*, probability_itm: float, premium: float, spot: float, strike: float, option_type: str) -> float:
+    """Rewards contracts with an asymmetric payoff: a realistic chance of
+    landing ITM relative to how far out of the money the strike sits, scaled
+    against how much premium is being risked to get there."""
+    if premium <= 0:
+        return 0.0
+    if option_type == "call":
+        intrinsic_potential = max(spot * 1.05 - strike, 0.0)  # value if spot rises 5%
+    else:
+        intrinsic_potential = max(strike - spot * 0.95, 0.0)  # value if spot falls 5%
+    payoff_ratio = intrinsic_potential / premium
+    payoff_score = _clamp(payoff_ratio / 3.0) * 100  # 3x premium as a realistic strong payoff
+    probability_weight = _clamp(probability_itm / 100)
+    return round((payoff_score * 0.6) + (probability_weight * 100 * 0.4), 1)
+
+
+def _risk_score(*, theta: float, premium: float, implied_vol: float) -> float:
+    """Lower theta decay (as % of premium/day) and calmer IV score higher;
+    fast-decaying, high-IV contracts are riskier to hold."""
+    if premium <= 0:
+        return 0.0
+    theta_pct = abs(theta) / premium
+    decay_score = _clamp(1.0 - theta_pct / MAX_THETA_DECAY_PCT) * 100
+    iv_score = _soft_peak_score(implied_vol, peak=0.35, width=0.55) * 100
+    return round((decay_score * 0.6) + (iv_score * 0.4), 1)
+
+
+def _greeks_score(*, delta: float, gamma: float, vega: float, premium: float) -> float:
+    """Favors a delta sweet spot (0.30-0.65 abs) that balances directional
+    exposure with cost, and penalizes gamma/vega risk that's large relative
+    to premium (i.e. a position that can swing wildly on small moves)."""
+    abs_delta = abs(delta)
+    delta_score = _soft_peak_score(abs_delta, peak=0.45, width=0.35) * 100
+    if premium > 0:
+        vega_ratio = vega / premium
+        vega_score = _clamp(1.0 - min(vega_ratio, 1.0)) * 100
+    else:
+        vega_score = 0.0
+    return round((delta_score * 0.7) + (vega_score * 0.3), 1)
+
+
+def passes_smart_filter(scored: "ScoredContract") -> tuple[bool, str]:
+    """Smart Contract Filter: reject illiquid, wide-spread, or fast-decaying
+    contracts so a bad contract never gets recommended just because it was
+    the closest strike."""
+    c = scored.contract
+    if c.open_interest < MIN_OPEN_INTEREST:
+        return False, f"open interest {c.open_interest} below {MIN_OPEN_INTEREST} minimum"
+    if c.volume < MIN_VOLUME:
+        return False, f"volume {c.volume} below {MIN_VOLUME} minimum"
+    if scored.spread_pct > MAX_SPREAD_PCT:
+        return False, f"bid/ask spread {scored.spread_pct * 100:.1f}% exceeds {MAX_SPREAD_PCT * 100:.0f}% maximum"
+    if scored.liquidity_score < MIN_LIQUIDITY_SCORE:
+        return False, f"liquidity score {scored.liquidity_score:.0f} below {MIN_LIQUIDITY_SCORE:.0f} minimum"
+    if scored.premium > 0 and abs(scored.theta) / scored.premium > MAX_THETA_DECAY_PCT:
+        return False, f"theta decay {abs(scored.theta) / scored.premium * 100:.1f}%/day of premium too high"
+    return True, ""
+
+
+def select_best_contract(
+    candidates: list[ScoredContract], *, days_to_earnings: Optional[int] = None,
+) -> tuple[Optional[ScoredContract], list[str]]:
+    """Smart Contract Filter + ranking: sorts candidates by composite_score
+    (best first) and returns the first one that passes every filter,
+    automatically falling through to the next-best contract rather than
+    failing outright. Returns the rejection reasons for every contract
+    skipped along the way, so the caller can be transparent about why."""
+    rejected: list[str] = []
+    ranked = sorted(candidates, key=lambda c: c.composite_score, reverse=True)
+    for scored in ranked:
+        ok, reason = passes_smart_filter(scored)
+        if not ok:
+            rejected.append(f"{scored.contract.strike} {scored.contract.expiration}: {reason}")
+            continue
+        if days_to_earnings is not None and 0 <= days_to_earnings <= 5 and scored.contract.implied_vol > 1.0:
+            rejected.append(
+                f"{scored.contract.strike} {scored.contract.expiration}: IV extremely inflated ahead of earnings"
+            )
+            continue
+        return scored, rejected
+    return None, rejected
+
+
 def _score_contract(contract: OptionContract, spot: float, dte: int) -> Optional[ScoredContract]:
     if contract.implied_vol <= 0 or contract.strike <= 0:
         return None
@@ -133,6 +232,25 @@ def _score_contract(contract: OptionContract, spot: float, dte: int) -> Optional
     # AND the absolute volume is large enough to not just be a thin contract.
     unusual_activity = vol_oi_ratio > 3.0 and contract.volume > 500
 
+    if contract.bid > 0 and contract.ask > 0:
+        mid = (contract.bid + contract.ask) / 2
+        spread_pct = (contract.ask - contract.bid) / mid if mid > 0 else 1.0
+    else:
+        spread_pct = 1.0
+
+    expected_return_score = _expected_return_score(
+        probability_itm=probability_itm * 100, premium=premium, spot=spot,
+        strike=contract.strike, option_type=contract.option_type,
+    )
+    risk_score = _risk_score(theta=theta, premium=premium, implied_vol=contract.implied_vol)
+    probability_score = round(probability_itm * 100, 1)
+    greeks_score = _greeks_score(delta=delta, gamma=gamma, vega=vega, premium=premium)
+    composite_score = round(
+        (liquidity_score * 0.25) + (expected_return_score * 0.25) + (probability_score * 0.20)
+        + (greeks_score * 0.15) + (risk_score * 0.15),
+        1,
+    )
+
     return ScoredContract(
         contract=contract,
         dte=dte,
@@ -140,10 +258,17 @@ def _score_contract(contract: OptionContract, spot: float, dte: int) -> Optional
         gamma=gamma,
         theta=theta,
         vega=vega,
-        probability_itm=round(probability_itm * 100, 1),
+        probability_itm=probability_score,
         liquidity_score=round(liquidity_score, 1),
         vol_oi_ratio=round(vol_oi_ratio, 2),
         unusual_activity=unusual_activity,
+        expected_return_score=expected_return_score,
+        risk_score=risk_score,
+        probability_score=probability_score,
+        greeks_score=greeks_score,
+        composite_score=composite_score,
+        spread_pct=round(spread_pct, 4),
+        premium=round(premium, 2),
     )
 
 

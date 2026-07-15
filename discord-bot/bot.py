@@ -163,6 +163,31 @@ async def alerts_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=bot_embeds.build_alerts_embed())
 
 
+@client.tree.command(name="setbalance", description="Set your account balance once -- AlphaOptionsAI saves it and reuses it for every /scan")
+@app_commands.describe(amount="Account balance in dollars, e.g. 10000")
+async def setbalance_cmd(interaction: discord.Interaction, amount: float) -> None:
+    if amount <= 0:
+        await interaction.response.send_message("⚠️ Account balance must be a positive number.")
+        return
+    database.set_account_balance(amount)
+    current_risk_pct = database.get_risk_pct()
+    risk_pct_display = (current_risk_pct if current_risk_pct is not None else 0.02) * 100
+    await interaction.response.send_message(
+        f"✅ Account balance saved: **${amount:,.2f}**. Every `/scan` will size positions off this balance "
+        f"(capped at {risk_pct_display:.1f}% risk per trade unless you change it with `/setrisk`)."
+    )
+
+
+@client.tree.command(name="setrisk", description="Set the max % of your account to risk per trade (default 2%)")
+@app_commands.describe(percent="Risk percent per trade, e.g. 2 for 2%")
+async def setrisk_cmd(interaction: discord.Interaction, percent: float) -> None:
+    if not (0 < percent <= 25):
+        await interaction.response.send_message("⚠️ Risk percent must be between 0 and 25.")
+        return
+    database.set_risk_pct(percent / 100)
+    await interaction.response.send_message(f"✅ Max risk per trade saved: **{percent:.1f}%** of account balance.")
+
+
 @client.event
 async def on_ready():
     await client.tree.sync()
