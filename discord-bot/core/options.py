@@ -178,8 +178,12 @@ def _iv_rank_percentile(current_iv: float, historical_close: pd.Series, current_
     if rolling_vol.empty:
         return None, None
     lo, hi = rolling_vol.min(), rolling_vol.max()
-    iv_rank = ((current_iv - lo) / (hi - lo) * 100) if hi > lo else None
-    iv_percentile = (rolling_vol < current_iv).mean() * 100
+    # Current IV can legitimately sit outside the trailing realized-vol range
+    # (implied vol usually carries a premium over realized, and can spike
+    # sharply ahead of catalysts like earnings) -- clamp to a valid 0-100%
+    # rank/percentile so we never display an impossible value like "118%".
+    iv_rank = _clamp((current_iv - lo) / (hi - lo) * 100, 0.0, 100.0) if hi > lo else None
+    iv_percentile = _clamp((rolling_vol < current_iv).mean() * 100, 0.0, 100.0)
     return (round(float(iv_rank), 1) if iv_rank is not None else None), round(float(iv_percentile), 1)
 
 
