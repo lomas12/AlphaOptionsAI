@@ -28,6 +28,14 @@ class Quote:
     volume: Optional[float]
     avg_volume: Optional[float]
     source: str
+    # When this price was actually observed (UTC). Required for staleness
+    # checks -- a provider that can't supply a real timestamp should leave
+    # this None rather than guessing "now".
+    as_of: Optional[datetime] = None
+    # An independent second reading of the price (e.g. a different endpoint
+    # or timeframe from the same provider), used to cross-check the primary
+    # price above before it's trusted. Left None if no second reading exists.
+    cross_check_price: Optional[float] = None
 
 
 @dataclass

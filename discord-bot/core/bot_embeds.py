@@ -32,9 +32,10 @@ def _color_for(recommendation: str) -> discord.Color:
 def build_trade_decision_embed(decision: ai_engine.TradeDecision) -> discord.Embed:
     banner = {"BUY CALL": "🟢 BUY CALL", "BUY PUT": "🔴 BUY PUT", "NO TRADE": "⚪ NO TRADE"}[decision.recommendation]
 
+    as_of_text = decision.price_as_of.strftime("%Y-%m-%d %H:%M:%S UTC") if decision.price_as_of else "unknown"
     embed = discord.Embed(
         title=f"{decision.ticker} — {banner}",
-        description=f"Current Price: **${decision.price:.2f}**  (source: {decision.price_source})",
+        description=f"Current Price: **${decision.price:.2f}**  (source: {decision.price_source}, as of {as_of_text})",
         color=_color_for(decision.recommendation),
         timestamp=datetime.now(timezone.utc),
     )
@@ -111,10 +112,13 @@ def build_trade_decision_embed(decision: ai_engine.TradeDecision) -> discord.Emb
     return embed
 
 
-def build_options_embed(ticker: str, chain_analysis) -> discord.Embed:
+def build_options_embed(ticker: str, chain_analysis, verified_quote=None) -> discord.Embed:
     embed = discord.Embed(title=f"{ticker} — Options Analysis", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+    if verified_quote is not None:
+        as_of_text = verified_quote.as_of.strftime("%Y-%m-%d %H:%M:%S UTC") if verified_quote.as_of else "unknown"
+        embed.description = f"Current Price: **${verified_quote.price:.2f}**  (source: {verified_quote.source}, as of {as_of_text})"
     if chain_analysis is None:
-        embed.description = UNAVAILABLE
+        embed.description = (embed.description + "\n\n" if embed.description else "") + UNAVAILABLE
         return embed
 
     embed.add_field(name="Expected Move", value=f"±${chain_analysis.expected_move:.2f} ({chain_analysis.expected_move_pct:.1f}%)", inline=True)
@@ -262,6 +266,20 @@ def build_backtest_embed(ticker: str, result) -> discord.Embed:
     embed.add_field(name="Profit Factor", value=_fmt(result.profit_factor), inline=True)
     embed.add_field(name="Expectancy", value=_fmt(result.expectancy, "%", 2), inline=True)
     embed.add_field(name="Methodology", value=result.methodology_note, inline=False)
+    return embed
+
+
+def build_market_data_unavailable_embed(ticker: str, reason: str) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"{ticker} — Market data unavailable",
+        description=(
+            "A verified, current price for this ticker could not be confirmed, "
+            "so no trade recommendation was generated.\n\n"
+            f"Reason: {reason}"
+        ),
+        color=COLOR_NEUTRAL,
+        timestamp=datetime.now(timezone.utc),
+    )
     return embed
 
 

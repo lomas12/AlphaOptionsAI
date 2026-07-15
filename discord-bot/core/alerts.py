@@ -82,6 +82,9 @@ async def _run_scan_and_maybe_alert(client: discord.Client, ticker: str) -> None
         decision = await ai_engine.analyze_ticker(ticker)
     except ai_engine.TickerNotFoundError:
         return
+    except ai_engine.MarketDataUnavailableError as exc:
+        logger.warning("Auto-scan skipped %s: %s", ticker, exc)
+        return
     except Exception as exc:
         logger.warning("Auto-scan failed for %s: %s", ticker, exc)
         return

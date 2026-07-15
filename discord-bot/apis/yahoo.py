@@ -3,7 +3,7 @@ unauthenticated provider today -- always available as the final fallback.
 """
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import yfinance as yf
@@ -32,15 +32,20 @@ def clean_ticker(raw: str) -> str:
 
 
 def get_quote(symbol: str) -> Quote | None:
+    """Fetch the current quote. A price is never trusted from a single
+    unverified snapshot: we always also pull the latest 1-minute intraday
+    bar (a second, independently-timestamped reading) so the caller can
+    cross-check the two and know exactly when the price was observed.
+    """
     tk = yf.Ticker(symbol)
 
-    price = None
+    snapshot_price = None
     previous_close = None
     day_high = day_low = volume = avg_volume = None
 
     try:
         fast_info = tk.fast_info
-        price = fast_info.get("lastPrice") or fast_info.get("last_price")
+        snapshot_price = fast_info.get("lastPrice") or fast_info.get("last_price")
         previous_close = fast_info.get("previousClose") or fast_info.get("previous_close")
         day_high = fast_info.get("dayHigh")
         day_low = fast_info.get("dayLow")
@@ -49,19 +54,38 @@ def get_quote(symbol: str) -> Quote | None:
     except Exception:
         pass
 
-    if price is None:
+    if snapshot_price is None:
         try:
             info = tk.info
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            snapshot_price = info.get("currentPrice") or info.get("regularMarketPrice")
             previous_close = previous_close or info.get("previousClose")
         except Exception:
             pass
 
+    # Independent, timestamped reading -- the source of truth for "as_of"
+    # and the cross-check for the snapshot price above.
+    intraday_price = None
+    intraday_as_of = None
+    try:
+        intraday = tk.history(period="2d", interval="1m")
+        if intraday is not None and not intraday.empty:
+            intraday_price = float(intraday["Close"].iloc[-1])
+            ts = intraday.index[-1].to_pydatetime()
+            intraday_as_of = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+
+    price = snapshot_price if snapshot_price is not None else intraday_price
+    as_of = intraday_as_of
+    cross_check_price = intraday_price if (snapshot_price is not None and intraday_price is not None) else None
+
     if price is None:
         try:
-            hist = tk.history(period="1d", interval="1d")
-            if hist is not None and not hist.empty:
-                price = float(hist["Close"].iloc[-1])
+            daily = tk.history(period="5d", interval="1d")
+            if daily is not None and not daily.empty:
+                price = float(daily["Close"].iloc[-1])
+                ts = daily.index[-1].to_pydatetime()
+                as_of = ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
         except Exception:
             pass
 
@@ -77,6 +101,8 @@ def get_quote(symbol: str) -> Quote | None:
         volume=float(volume) if volume else None,
         avg_volume=float(avg_volume) if avg_volume else None,
         source=NAME,
+        as_of=as_of,
+        cross_check_price=cross_check_price,
     )
 
 

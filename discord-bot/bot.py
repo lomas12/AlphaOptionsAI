@@ -4,7 +4,7 @@ import sys
 import discord
 from discord import app_commands
 
-from core import ai_engine, alerts, backtester as backtester_module, bot_embeds, database, portfolio as portfolio_module
+from core import ai_engine, alerts, backtester as backtester_module, bot_embeds, database, market_data as market_data_module, portfolio as portfolio_module
 from core.logging_config import get_logger
 
 logger = get_logger("bot")
@@ -42,6 +42,10 @@ async def scan(interaction: discord.Interaction, ticker: str) -> None:
     except ai_engine.TickerNotFoundError as exc:
         await interaction.followup.send(str(exc))
         return
+    except ai_engine.MarketDataUnavailableError as exc:
+        logger.warning("Market data unavailable for %s: %s", ticker, exc)
+        await interaction.followup.send(embed=bot_embeds.build_market_data_unavailable_embed(ticker.upper(), str(exc)))
+        return
     except Exception:
         logger.exception("scan failed for %s", ticker)
         await interaction.followup.send(f"⚠️ Couldn't complete the scan for '{ticker.upper()}'. Please try again shortly.")
@@ -69,14 +73,17 @@ async def options_cmd(interaction: discord.Interaction, ticker: str) -> None:
     from core import options as options_module
 
     symbol = clean_ticker(ticker)
-    quote_result = router.get_quote(symbol)
-    if not quote_result.available:
-        await interaction.followup.send(f"❌ Could not find ticker {symbol}")
+    try:
+        verified_quote = market_data_module.get_verified_quote(symbol)
+    except market_data_module.MarketDataUnavailableError as exc:
+        logger.warning("Market data unavailable for %s: %s", symbol, exc)
+        await interaction.followup.send(embed=bot_embeds.build_market_data_unavailable_embed(symbol, str(exc)))
         return
+
     history_result = router.get_history(symbol, period="1y")
     closes = history_result.value.df["Close"].dropna() if history_result.available else None
-    chain_analysis = options_module.analyze_chain(symbol, quote_result.value.price, closes)
-    await interaction.followup.send(embed=bot_embeds.build_options_embed(symbol, chain_analysis))
+    chain_analysis = options_module.analyze_chain(symbol, verified_quote.price, closes)
+    await interaction.followup.send(embed=bot_embeds.build_options_embed(symbol, chain_analysis, verified_quote))
 
 
 @client.tree.command(name="news", description="Latest news, analyst actions, insider activity, and SEC filings for a ticker")

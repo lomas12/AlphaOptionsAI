@@ -13,15 +13,17 @@ from API" instead of a silent gap.
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 from apis import router
-from apis.base import Quote
 from apis.yahoo import clean_ticker
-from core import database, earnings as earnings_module, market as market_module, news as news_module, options as options_module, risk as risk_module, technicals as technicals_module
+from core import database, earnings as earnings_module, market as market_module, market_data as market_data_module, news as news_module, options as options_module, risk as risk_module, technicals as technicals_module
 
 CONFIDENCE_TRADE_THRESHOLD = 70.0
 SECTOR_ETF_HINTS = market_module.SECTOR_ETFS
+
+MarketDataUnavailableError = market_data_module.MarketDataUnavailableError
 
 
 class TickerNotFoundError(Exception):
@@ -54,6 +56,7 @@ class TradeDecision:
     chain_analysis: Optional[options_module.ChainAnalysis]
     missing_data: list[str]
     price_source: str
+    price_as_of: datetime
 
 
 _HEADWIND_TAGS = {
@@ -244,12 +247,15 @@ def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecisi
 
     missing_data: list[str] = []
 
-    quote_result = router.get_quote(symbol)
-    if not quote_result.available:
-        raise TickerNotFoundError(f"❌ Could not find ticker {symbol}")
-    quote: Quote = quote_result.value
-    current_price = quote.price
-    price_source = quote_result.source
+    # Verify the current price before doing anything else: fresh, matches
+    # the latest market quote, and never estimated/hardcoded. Every
+    # downstream calculation (technicals, expected move, support/
+    # resistance, strike selection, greeks, probability) uses this same
+    # verified price.
+    verified_quote = market_data_module.get_verified_quote(symbol)
+    current_price = verified_quote.price
+    price_source = verified_quote.source
+    price_as_of = verified_quote.as_of
 
     history_result = router.get_history(symbol, period="1y", interval="1d")
     if not history_result.available:
@@ -289,7 +295,7 @@ def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecisi
             risk_reward_ratio=None, dollar_risk_per_contract=None, max_risk_dollars=None,
             position_size_contracts=None, risk_rating=None, tags=[], account_balance=account_balance,
             snapshot=snapshot, market=market, news_context=news_ctx, earnings_context=earnings_ctx,
-            chain_analysis=None, missing_data=missing_data, price_source=price_source,
+            chain_analysis=None, missing_data=missing_data, price_source=price_source, price_as_of=price_as_of,
         )
 
     best_call = max(chain_analysis.calls, key=lambda c: c.liquidity_score)
@@ -320,7 +326,7 @@ def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecisi
             risk_reward_ratio=None, dollar_risk_per_contract=None, max_risk_dollars=None,
             position_size_contracts=None, risk_rating=None, tags=tags, account_balance=account_balance,
             snapshot=snapshot, market=market, news_context=news_ctx, earnings_context=earnings_ctx,
-            chain_analysis=chain_analysis, missing_data=missing_data, price_source=price_source,
+            chain_analysis=chain_analysis, missing_data=missing_data, price_source=price_source, price_as_of=price_as_of,
         )
 
     contract = scored.contract
@@ -363,5 +369,5 @@ def _analyze_ticker_sync(raw_ticker: str, account_balance: float) -> TradeDecisi
         position_size_contracts=plan.position_size_contracts, risk_rating=risk_rating, tags=tags,
         account_balance=account_balance, snapshot=snapshot, market=market, news_context=news_ctx,
         earnings_context=earnings_ctx, chain_analysis=chain_analysis, missing_data=missing_data,
-        price_source=price_source,
+        price_source=price_source, price_as_of=price_as_of,
     )
