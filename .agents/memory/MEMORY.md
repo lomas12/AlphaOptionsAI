@@ -2,3 +2,4 @@
 - [AlphaOptionsAI trade engine design](alphaoptionsai-trade-engine.md) — self-learning confidence scoring architecture and data-source fallbacks for the Discord options bot.
 - [AlphaOptionsAI universe scanner](alphaoptionsai-universe-scanner.md) — NASDAQ∩CBOE optionable universe, cache-preserving refresh rails, rotating prescreen funnel.
 - [Publishing non-artifact processes](publishing-non-artifact-processes.md) — publish gate needs a web artifact; bot rides along with api-server prod service on a Reserved VM.
+- [GitHub push credentials](github-push-credentials.md) — connector OAuth is proxy-scoped (no raw token in sandbox); git pushes need the user's Git-pane GitHub link or gitPush fails NO_CREDENTIALS.
